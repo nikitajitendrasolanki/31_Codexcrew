@@ -15,3 +15,5 @@ yarn-error.log*
 # IDE / editor settings
 .vscode
 .idea
+"cv-module/snapshots/" 
+"cv-module/*.mp4" 
