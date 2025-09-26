@@ -1,0 +1,8 @@
+{
+  "test1.jpg": [
+    {"bbox": [50, 50, 150, 150], "class": "car"}
+  ],
+  "test2.jpg": [
+    {"bbox": [30, 40, 120, 160], "class": "motorbike"}
+  ]
+}

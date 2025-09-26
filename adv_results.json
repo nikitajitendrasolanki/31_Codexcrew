@@ -1,0 +1,113 @@
+{
+  "test1.jpg": {
+    "base": {
+      "car": 8,
+      "traffic light": 1
+    },
+    "perturbations": {
+      "blur": {
+        "car": {
+          "base": 8,
+          "pert": 8
+        },
+        "traffic light": {
+          "base": 1,
+          "pert": 1
+        }
+      },
+      "dark": {
+        "car": {
+          "base": 8,
+          "pert": 8
+        },
+        "traffic light": {
+          "base": 1,
+          "pert": 2
+        }
+      },
+      "noise": {
+        "car": {
+          "base": 8,
+          "pert": 9
+        },
+        "traffic light": {
+          "base": 1,
+          "pert": 1
+        }
+      },
+      "jpeg": {
+        "car": {
+          "base": 8,
+          "pert": 8
+        },
+        "traffic light": {
+          "base": 1,
+          "pert": 1
+        }
+      },
+      "occlude": {
+        "car": {
+          "base": 8,
+          "pert": 7
+        },
+        "traffic light": {
+          "base": 1,
+          "pert": 1
+        }
+      },
+      "patch": {
+        "car": {
+          "base": 8,
+          "pert": 8
+        },
+        "traffic light": {
+          "base": 1,
+          "pert": 1
+        }
+      }
+    }
+  },
+  "test2.jpg": {
+    "base": {
+      "car": 5
+    },
+    "perturbations": {
+      "blur": {
+        "car": {
+          "base": 5,
+          "pert": 6
+        }
+      },
+      "dark": {
+        "car": {
+          "base": 5,
+          "pert": 6
+        }
+      },
+      "noise": {
+        "car": {
+          "base": 5,
+          "pert": 5
+        }
+      },
+      "jpeg": {
+        "car": {
+          "base": 5,
+          "pert": 5
+        }
+      },
+      "occlude": {
+        "car": {
+          "base": 5,
+          "pert": 1
+        }
+      },
+      "patch": {
+        "car": {
+          "base": 5,
+          "pert": 5
+        }
+      }
+    }
+  }
+}

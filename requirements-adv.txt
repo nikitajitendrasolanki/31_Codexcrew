@@ -1,0 +1,16 @@
+ultralytics
+opencv-python
+numpy
+matplotlib
+pillow
+pandas
+scikit-learn
+seaborn
+torch
+torchvision
+easyocr          # optional, if you used OCR
+shap              # optional (but for images prefer Grad-CAM)
+lime              # optional
+reportlab         # to create PDFs
+imgaug            # augmentations
+tqdm
