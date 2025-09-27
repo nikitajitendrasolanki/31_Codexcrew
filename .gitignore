@@ -42,3 +42,6 @@ __pycache__/
 # Project specific (traffic project)
 cv-module/snapshots/
 cv-module/tmp/
+
+venv/
+.cv-module/venv/
