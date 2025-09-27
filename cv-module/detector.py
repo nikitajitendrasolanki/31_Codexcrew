@@ -1,19 +1,11 @@
-import time
-import os
-import cv2
-import numpy as np
+import time, os, re, cv2, numpy as np
 from ultralytics import YOLO
+from datetime import datetime
 
+from db import insert_violation, init_db
 from rule_engine import RuleEngine
-from utils import ensure_dirs, init_db
-from tools.auto_calibrate import AutoCalibrator   # Auto calibration import
-
-# optional libs
-try:
-    from deep_sort_realtime.deepsort_tracker import DeepSort
-    DEEPSORT_AVAILABLE = True
-except Exception:
-    DEEPSORT_AVAILABLE = False
+from utils import ensure_dirs
+from tools.auto_calibrate import AutoCalibrator
 
 try:
     import easyocr
@@ -22,67 +14,133 @@ except Exception:
     EASYOCR_AVAILABLE = False
 
 
-# ------------------- Helper utils -------------------
-def iou(boxA, boxB):
-    xA = max(boxA[0], boxB[0])
-    yA = max(boxA[1], boxB[1])
-    xB = min(boxA[2], boxB[2])
-    yB = min(boxA[3], boxB[3])
-    interW = max(0, xB - xA)
-    interH = max(0, yB - yA)
-    interArea = interW * interH
-    boxAArea = max(1, (boxA[2] - boxA[0])) * max(1, (boxA[3] - boxA[1]))
-    boxBArea = max(1, (boxB[2] - boxB[0])) * max(1, (boxB[3] - boxB[1]))
-    return interArea / (boxAArea + boxBArea - interArea + 1e-9)
+# ---------------- Helpers ----------------
+def clean_plate_text(text: str) -> str:
+    if not text:
+        return "NOT_DETECTED"
+    t = text.upper()
+    t = re.sub(r'[^A-Z0-9]', '', t)
+    return t if t else "NOT_DETECTED"
 
 
-# ------------------- SimpleTracker (fallback) -------------------
+def detect_red_light_violations(tracked_list, tl_state, stop_line_y, min_frames_cross=1):
+    """Detect signal break when crossing stop line on RED light."""
+    vios = []
+    if tl_state is None or tl_state.upper() != "RED":
+        return vios
+
+    for t in tracked_list:
+        hist = t.get("history", [])
+        if not hist or len(hist) < 2:
+            continue
+        cur_cent = hist[-1]
+        prev_idx = max(0, len(hist) - 1 - min_frames_cross)
+        prev_cent = hist[prev_idx]
+        if prev_cent[1] < stop_line_y and cur_cent[1] >= stop_line_y:
+            vios.append({
+                "track_id": t["track_id"],
+                "type": "signal_break",
+                "bbox": t.get("bbox"),
+                "plate": t.get("plate"),
+                "speed_kmph": t.get("velocity_kmph"),
+                "conf": t.get("conf", 0.0)
+            })
+    return vios
+
+
+def detect_wrong_way_violations(tracked_list, allowed_direction,
+                                wrong_dot_thresh=-0.5, min_speed_kmph=6.0):
+    """Detect vehicles moving opposite to allowed traffic direction."""
+    vios = []
+    if allowed_direction is None:
+        return vios
+
+    try:
+        adx, ady = allowed_direction
+        mag = (adx**2 + ady**2) ** 0.5
+        if mag == 0:
+            return vios
+        adx /= mag
+        ady /= mag
+    except Exception:
+        return vios
+
+    for t in tracked_list:
+        hist = t.get("history", [])
+        if not hist or len(hist) < 2:
+            continue
+        x_prev, y_prev = hist[-2]
+        x_cur, y_cur = hist[-1]
+        vx, vy = x_cur - x_prev, y_cur - y_prev
+        vmag = (vx**2 + vy**2) ** 0.5
+        if vmag < 1e-6:
+            continue
+
+        dot = (vx * adx + vy * ady) / vmag
+        speed = t.get("velocity_kmph") or 0.0
+        if dot < wrong_dot_thresh and speed >= min_speed_kmph:
+            vios.append({
+                "track_id": t["track_id"],
+                "type": "wrong_way",
+                "bbox": t.get("bbox"),
+                "plate": t.get("plate"),
+                "speed_kmph": speed,
+                "conf": t.get("conf", 0.0)
+            })
+    return vios
+
+
+# ---------------- Simple Tracker ----------------
 class SimpleTracker:
-    def __init__(self, max_lost=30):  # Increased max_lost for better persistence
+    def __init__(self, max_lost=30, vel_hist_len=5):
         self.next_id = 0
         self.objects = {}
         self.max_lost = max_lost
+        self.vel_hist_len = vel_hist_len
 
     def update(self, detections, timestamp):
-        new_objs = {}
-        used = set()
+        new_objs, used = {}, set()
         centroids = [((d['bbox'][0] + d['bbox'][2]) // 2,
                       (d['bbox'][1] + d['bbox'][3]) // 2) for d in detections]
 
-        for oid, data in self.objects.items():
+        for oid, data in list(self.objects.items()):
             best_i, best_d = None, 1e9
             for i, c in enumerate(centroids):
                 if i in used:
                     continue
-                d = (c[0] - data['centroid'][0]) ** 2 + (c[1] - data['centroid'][1]) ** 2
-                if d < best_d:
-                    best_i, best_d = i, d
+                d2 = (c[0] - data['centroid'][0]) ** 2 + (c[1] - data['centroid'][1]) ** 2
+                if d2 < best_d:
+                    best_i, best_d = i, d2
             if best_i is not None and best_d < 140 ** 2:
                 i = best_i
                 used.add(i)
                 det = detections[i]
                 hist = data.get('history', []) + [centroids[i]]
                 velocity = None
+                vel_hist = data.get('vel_hist', [])
                 if data.get('last_update_time') is not None:
                     dt = max(1e-4, timestamp - data['last_update_time'])
                     dx = centroids[i][0] - data['centroid'][0]
                     dy = centroids[i][1] - data['centroid'][1]
-                    velocity = ((dx ** 2 + dy ** 2) ** 0.5) / dt
+                    step_vel = ((dx ** 2 + dy ** 2) ** 0.5) / dt
+                    vel_hist = (vel_hist + [step_vel])[-self.vel_hist_len:]
+                    velocity = float(np.mean(vel_hist)) if vel_hist else None
                 new_objs[oid] = {
                     'centroid': centroids[i],
                     'bbox': det['bbox'],
                     'conf': det['conf'],
                     'cls': det['cls'],
-                    'cls_name': det.get('cls_name', None),
+                    'cls_name': det.get('cls_name'),
                     'lost': 0,
                     'history': hist,
                     'last_update_time': timestamp,
-                    'velocity': velocity
+                    'velocity': velocity,
+                    'vel_hist': vel_hist
                 }
             else:
                 data['lost'] = data.get('lost', 0) + 1
                 if data['lost'] < self.max_lost:
-                    new_objs[oid] = data  # Preserves conf, cls_name, etc.
+                    new_objs[oid] = data
 
         for i, det in enumerate(detections):
             if i in used:
@@ -95,302 +153,155 @@ class SimpleTracker:
                 'bbox': det['bbox'],
                 'conf': det['conf'],
                 'cls': det['cls'],
-                'cls_name': det.get('cls_name', None),
+                'cls_name': det.get('cls_name'),
                 'lost': 0,
                 'history': [cent],
                 'last_update_time': timestamp,
-                'velocity': None
+                'velocity': None,
+                'vel_hist': []
             }
 
         self.objects = new_objs
         return self.objects
 
 
-# ------------------- Main Detector -------------------
+# ---------------- TrafficDetector ----------------
 class TrafficDetector:
-    def __init__(self, model_path="models/yolov8n.pt",
-                 helmet_model_path="models/helmet_best.pt",
-                 plate_model_path="models/plate_best.pt",
-                 conf=0.35,
-                 plate_ocr_cooldown_s=60):
+    def __init__(self,
+                 model_path="models/yolov8n.pt",
+                 plate_model_path="models/yolov8n-license-plate.pt",
+                 conf=0.6,
+                 easyocr_gpu=False):
         ensure_dirs()
         self.model = YOLO(model_path)
         self.conf = conf
-        self.rule_engine = RuleEngine()
-        self.db_conn = init_db()
-
-        if DEEPSORT_AVAILABLE:
-            try:
-                self.deepsort = DeepSort(max_age=30)
-                self.use_deepsort = True
-            except Exception:
-                self.deepsort = None
-                self.use_deepsort = False
-        else:
-            self.deepsort = None
-            self.use_deepsort = False
-
-        self.simple_tracker = SimpleTracker(max_lost=30)  # Increased for stability
-
-        self.helmet_model = YOLO(helmet_model_path) if os.path.exists(helmet_model_path) else None
-        self.plate_model = YOLO(plate_model_path) if os.path.exists(plate_model_path) else None
-
-        self.ocr = None
-        if EASYOCR_AVAILABLE:
-            try:
-                self.ocr = easyocr.Reader(['en'], gpu=False)
-            except Exception:
-                self.ocr = None
-
-        self.plate_cache = {}
-        self.plate_cooldown = plate_ocr_cooldown_s
-
+        self.db_coll = init_db()
+        self.rule_engine = RuleEngine(db_conn=self.db_coll)
+        self.simple_tracker = SimpleTracker(max_lost=30, vel_hist_len=5)
+        self.plate_model = YOLO(plate_model_path) if plate_model_path and os.path.exists(plate_model_path) else None
+        self.ocr = easyocr.Reader(['en'], gpu=easyocr_gpu) if EASYOCR_AVAILABLE else None
         self.calibrator = AutoCalibrator(target_seconds=15, fps=25, min_vehicles=6, debug=False)
-        self.fps = 25.0
         self.pixsec_to_kmph = None
+        self._assumed_car_width_m = 1.8
+        self.valid_classes = {"car", "truck", "bus", "motorbike"}
 
-        self.VALID_CLASSES = {"car", "motorbike", "bus", "truck", "bicycle",
-                              "traffic light", "person", "motorcycle", "van"}
+    def _classify_tl_color(self, crop):
+        hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+        mask_red = cv2.inRange(hsv, (0,70,50), (10,255,255)) + cv2.inRange(hsv, (170,70,50), (180,255,255))
+        mask_green = cv2.inRange(hsv, (40,40,40), (90,255,255))
+        mask_yellow = cv2.inRange(hsv, (15,40,40), (35,255,255))
 
-        # Traffic light persistence
-        self._last_tl_state = "UNKNOWN"
-        self._last_tl_conf = 0.0
-        self._tl_persist_frames = 0
-        self._max_tl_persist = 10
+        if cv2.countNonZero(mask_red) > 50: return "RED"
+        if cv2.countNonZero(mask_green) > 50: return "GREEN"
+        if cv2.countNonZero(mask_yellow) > 50: return "YELLOW"
+        return "UNKNOWN"
 
-    # --- OCR helper ---
-    def _read_plate_easyocr(self, img):
-        if self.ocr is None:
-            return ""
-        try:
-            res = self.ocr.readtext(img, detail=1)
-            if not res:
-                return ""
-            res_sorted = sorted(res, key=lambda x: x[2], reverse=True)
-            return res_sorted[0][1].strip()
-        except Exception:
-            return ""
-
-    def _try_plate_detector(self, frame, vehicle_bbox):
-        x1, y1, x2, y2 = vehicle_bbox
-        h, w = frame.shape[:2]
-        x1, y1 = max(0, x1), max(0, y1)
-        x2, y2 = min(w, x2), min(h, y2)
-        crop = frame[y1:y2, x1:x2]
-        if crop.size == 0:
-            return ""
-        if self.plate_model is not None:
-            try:
-                r = self.plate_model.predict(crop, imgsz=320, conf=0.35, verbose=False)[0]
-                if r.boxes is not None and len(r.boxes) > 0:
-                    b = r.boxes[0]
-                    bx1, by1, bx2, by2 = [int(v) for v in b.xyxy[0].cpu().numpy()]
-                    plate_crop = crop[by1:by2, bx1:bx2]
-                    if plate_crop.size == 0:
-                        plate_crop = crop
-                    return self._read_plate_easyocr(plate_crop) if self.ocr else ""
-            except Exception:
-                pass
-        return self._read_plate_easyocr(crop) if self.ocr else ""
-
-    # --- Main detection per frame ---
-    def detect_frame(self, frame, timestamp=None):
-        if timestamp is None:
-            timestamp = time.time()
-
-        res = self.model.predict(frame, imgsz=640, conf=self.conf, verbose=False)[0]
-
+    def detect_frame(self, frame):
+        timestamp = time.time()
+        results = self.model(frame)
         dets = []
-        if res.boxes is not None:
-            for b in res.boxes:
-                xy = b.xyxy[0].cpu().numpy()
-                x1, y1, x2, y2 = [int(v) for v in xy]
-                conf = float(b.conf[0].cpu().numpy())
-                cls = int(b.cls[0].cpu().numpy())
-                name = res.names[cls] if res.names and cls in res.names else str(cls)
-                if name not in self.VALID_CLASSES:
+
+        for r in results:
+            for box in getattr(r, "boxes", []):
+                coords = box.xyxy[0].cpu().numpy()
+                x1, y1, x2, y2 = map(int, coords)
+                conf = float(box.conf[0].cpu().numpy())
+                cls_id = int(box.cls[0])
+                name = self.model.names[cls_id]
+                if conf < self.conf or name not in self.valid_classes and name != "traffic light":
                     continue
-                dets.append({'bbox': (x1, y1, x2, y2), 'cls': cls, 'cls_name': name, 'conf': conf})
+                dets.append({"cls": cls_id, "conf": conf,
+                             "bbox": (x1, y1, x2, y2),
+                             "cls_name": name})
 
-        # --- tracking ---
+        # tracking
         tracked_list = []
-        if self.use_deepsort and self.deepsort is not None:
-            try:
-                boxes_for_ds = [
-                    [[d['bbox'][0], d['bbox'][1], d['bbox'][2], d['bbox'][3]], d['conf'], d['cls_name']]
-                    for d in dets
-                ]
-                tracks = self.deepsort.update_tracks(boxes_for_ds, frame=frame)
-                
-                # Improved: Match tracks to detections for class/conf propagation
-                track_to_det = {}
-                for t in tracks:
-                    if hasattr(t, "is_confirmed") and not t.is_confirmed():
-                        continue
-                    l, t_, r, b = t.to_ltrb()
-                    bbox = (int(l), int(t_), int(r), int(b))
-                    best_det = None
-                    best_iou = 0
-                    for d in dets:
-                        iou_val = iou(bbox, d['bbox'])
-                        if iou_val > best_iou:
-                            best_iou = iou_val
-                            best_det = d
-                    track_to_det[int(t.track_id)] = best_det
+        tracked_obj_map = self.simple_tracker.update(dets, timestamp)
+        for oid, obj in tracked_obj_map.items():
+            vel_pix = obj.get('velocity')
+            vel_kmph = vel_pix * self.pixsec_to_kmph if (vel_pix and self.pixsec_to_kmph) else 0.0
+            tracked_list.append({
+                'track_id': oid,
+                **obj,
+                'velocity_kmph': vel_kmph,
+                'plate': "NOT_DETECTED"
+            })
 
-                for t in tracks:
-                    if hasattr(t, "is_confirmed") and not t.is_confirmed():
-                        continue
-                    l, t_, r, b = t.to_ltrb()
-                    bbox = (int(l), int(t_), int(r), int(b))
-                    tid = int(t.track_id)
-                    best_det = track_to_det.get(tid)
-                    cls_name = best_det['cls_name'] if best_det else 'unknown'
-                    conf = best_det['conf'] if best_det else 0.0
-                    cls = best_det['cls'] if best_det else None
-                    tracked_list.append({
-                        'track_id': tid,
-                        'bbox': bbox,
-                        'centroid': ((bbox[0] + bbox[2]) // 2, (bbox[1] + bbox[3]) // 2),
-                        'cls': cls,
-                        'cls_name': cls_name,
-                        'conf': conf,
-                        'velocity': None,
-                        'history': []
-                    })
-            except Exception as e:
-                print(f"[WARN] DeepSORT failed: {e}. Falling back to SimpleTracker.")
-                self.use_deepsort = False
+        # number plate detection
+        if self.plate_model and self.ocr:
+            for t in tracked_list:
+                x1,y1,x2,y2 = t['bbox']
+                crop = frame[y1:y2, x1:x2]
+                plate_res = self.plate_model(crop)
+                for r in plate_res:
+                    for b in getattr(r, "boxes", []):
+                        px1, py1, px2, py2 = map(int, b.xyxy[0].cpu().numpy())
+                        plate_crop = crop[py1:py2, px1:px2]
+                        text = self.ocr.readtext(plate_crop, detail=0)
+                        if text:
+                            t['plate'] = clean_plate_text("".join(text))
 
-        if not tracked_list:
-            ts_input = [{'bbox': d['bbox'], 'cls': d['cls'],
-                         'conf': d['conf'], 'cls_name': d.get('cls_name')} for d in dets]
-            tracked_obj_map = self.simple_tracker.update(ts_input, timestamp)
-            for oid, obj in tracked_obj_map.items():
-                pix_v = obj.get('velocity')
-                vel_kmph = None
-                if pix_v is not None and getattr(self, "pixsec_to_kmph", None):
-                    vel_kmph = pix_v * self.pixsec_to_kmph
-                tracked_list.append({
-                    'track_id': oid,
-                    'bbox': obj['bbox'],
-                    'centroid': obj['centroid'],
-                    'cls': obj.get('cls'),
-                    'cls_name': obj.get('cls_name', None),
-                    'conf': obj.get('conf', 0.0),
-                    'velocity': pix_v,
-                    'velocity_kmph': vel_kmph,
-                    'history': obj.get('history', [])
-                })
-
-        # --- Improved IoU refresh for every tracked object (looser matching for movement) ---
-        for obj in tracked_list:
-            if obj.get("cls_name") in [None, "unknown"] or obj.get("conf", 0.0) < 0.1:
-                best_match, best_iou, best_dist = None, 0, float('inf')
-                obj_centroid = obj['centroid']
-                for d in dets:
-                    iou_val = iou(obj['bbox'], d['bbox'])
-                    # Fallback to centroid distance if IoU low (for movement)
-                    d_centroid = ((d['bbox'][0] + d['bbox'][2]) // 2, (d['bbox'][1] + d['bbox'][3]) // 2)
-                    cent_dist = ((d_centroid[0] - obj_centroid[0]) ** 2 + (d_centroid[1] - obj_centroid[1]) ** 2) ** 0.5
-                    if iou_val > best_iou or (iou_val > 0.05 and cent_dist < best_dist):
-                        best_iou = iou_val
-                        best_dist = cent_dist
-                        best_match = d
-                if best_match and (best_iou > 0.1 or best_dist < 100):  # Looser thresholds: IoU 0.1 or dist <100px
-                    obj["cls_name"] = best_match["cls_name"]
-                    obj["conf"] = best_match["conf"]
-                    obj["cls"] = best_match["cls"]
-
-        # --- calibration ---
-        cal_out = self.calibrator.update(tracked_list, frame=frame)
-        if cal_out.get('allowed_direction') is not None:
-            self.rule_engine.allowed_direction = tuple(cal_out['allowed_direction'])
-        if cal_out.get('meters_per_pixel') is not None:
-            self.rule_engine.meters_per_pixel = cal_out['meters_per_pixel']
+        # calibration
+        cal_out = self.calibrator.update(tracked_list, frame=frame) or {}
+        if cal_out.get('meters_per_pixel'):
             self.pixsec_to_kmph = cal_out['meters_per_pixel'] * 3.6
-        else:
-            self.pixsec_to_kmph = getattr(self, "pixsec_to_kmph", None)
+        if not self.pixsec_to_kmph:  # fallback
+            widths = [o['bbox'][2]-o['bbox'][0] for o in tracked_list if o['cls_name'] in self.valid_classes]
+            if widths:
+                avg_w = np.mean(widths)
+                self.pixsec_to_kmph = (self._assumed_car_width_m / avg_w) * 3.6
 
-        # --- violations ---
-        violations = self.rule_engine.check(frame, tracked_list, self.db_conn) or []
+        if self.rule_engine.stop_line_y is None:
+            self.rule_engine.stop_line_y = int(frame.shape[0] * 0.8)
+        allowed_dir = getattr(self.rule_engine, "allowed_direction", (0, 1))
+        tl_state = self.rule_engine._get_traffic_light_state(frame, tracked_list)
 
-        # --- plate attach ---
-        for v in violations:
-            tid = v.get('track_id')
-            if tid is None:
-                continue
-            if not v.get('plate'):
-                cache_entry = self.plate_cache.get(tid)
-                if cache_entry and (time.time() - cache_entry[1]) < self.plate_cooldown:
-                    v['plate'] = cache_entry[0]
-                else:
-                    bbox = None
-                    for t in tracked_list:
-                        if t['track_id'] == tid:
-                            bbox = t['bbox']; break
-                    if bbox is not None:
-                        plate_text = self._try_plate_detector(frame, bbox)
-                        if plate_text:
-                            v['plate'] = plate_text
-                            self.plate_cache[tid] = (plate_text, time.time())
+        # backup TL classifier if unknown
+        if tl_state is None or tl_state == "UNKNOWN":
+            for d in dets:
+                if d["cls_name"] == "traffic light":
+                    x1,y1,x2,y2 = d["bbox"]
+                    crop = frame[y1:y2, x1:x2]
+                    tl_state = self._classify_tl_color(crop)
+                    break
 
-        # --- annotation ---
+        # violations
+        signal_vios = detect_red_light_violations(tracked_list, tl_state, self.rule_engine.stop_line_y)
+        wrong_vios = detect_wrong_way_violations(tracked_list, allowed_dir)
+        other_vios = self.rule_engine.check(frame, tracked_list) or []
+        violations = signal_vios + wrong_vios + other_vios
+
+        # --- Annotation ---
         annotated = frame.copy()
-        vio_map = {}
+
+        # stop line
+        color = (0, 255, 0) if tl_state != "RED" else (0, 0, 255)
+        cv2.line(annotated, (0, self.rule_engine.stop_line_y),
+                 (frame.shape[1], self.rule_engine.stop_line_y), color, 2)
+
+        # allowed direction arrow
+        ax, ay = allowed_dir
+        center = (frame.shape[1]//2, frame.shape[0]-30)
+        cv2.arrowedLine(annotated, center,
+                        (center[0]+int(ax*80), center[1]-int(ay*80)),
+                        (0,255,0), 3, tipLength=0.4)
+
+        for t in tracked_list:
+            x1,y1,x2,y2 = t['bbox']
+            is_violation = any(v["track_id"] == t["track_id"] for v in violations)
+            color = (0,0,255) if is_violation else (0,255,0)
+            thickness = 3 if is_violation else 2
+
+            cv2.rectangle(annotated, (x1,y1), (x2,y2), color, thickness)
+            label = f"{t['cls_name']} {t['velocity_kmph']:.1f}km/h"
+            if t.get("plate") and t["plate"] != "NOT_DETECTED":
+                label += f" [{t['plate']}]"
+            cv2.putText(annotated, label, (x1, max(20,y1-10)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+
         for v in violations:
-            tid = v.get('track_id')
-            if tid is not None:
-                vio_map.setdefault(tid, []).append(v)
-
-        for obj in tracked_list:
-            x1, y1, x2, y2 = obj['bbox']
-            tid = obj['track_id']
-
-            cls_name = obj.get('cls_name', 'vehicle')
-            conf_val = obj.get('conf', 0.0)
-            vel_kmph = obj.get('velocity_kmph')
-            vel_str = f" {vel_kmph:.1f}km/h" if vel_kmph else ""
-
-            if tid in vio_map:
-                types = [vv.get('type', 'violation') for vv in vio_map[tid]]
-                main_label = " | ".join([t.upper() for t in types])
-                plate_txt = next((vv.get("plate") for vv in vio_map[tid] if vv.get("plate")), None)
-                if plate_txt:
-                    label = f"{main_label} | Plate: {plate_txt}"
-                else:
-                    label = main_label
-                box_color = (0, 0, 255)
-            else:
-                label = f"ID:{tid} {cls_name} {conf_val:.2f}{vel_str}"
-                box_color = (0, 255, 0)
-
-            cv2.rectangle(annotated, (x1, y1), (x2, y2), box_color, 2)
-            cv2.putText(annotated, label, (x1, max(15, y1 - 10)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2)
-
-        # --- Improved traffic light detection with persistence ---
-        traffic_lights = [d for d in dets if d['cls_name'].lower() == "traffic light" and d['conf'] > 0.4]  # Higher conf for stability
-        if traffic_lights:
-            best = max(traffic_lights, key=lambda x: x['conf'])
-            self._last_tl_conf = best['conf']  # Update conf
-            tl_state = self.rule_engine._get_traffic_light_state(frame, tracked_list)
-            if tl_state == 'unknown' and best['conf'] > 0.5:
-                tl_state = f"Detected (conf={best['conf']:.2f})"  # Force if high conf
-            self._last_tl_state = tl_state
-            self._tl_persist_frames = 0  # Reset counter
-        else:
-            self._tl_persist_frames += 1
-            if self._tl_persist_frames < self._max_tl_persist and self._last_tl_conf > 0.5:
-                tl_state = self._last_tl_state  # Persist longer
-            else:
-                tl_state = "UNKNOWN (Lost)"
-                self._last_tl_state = tl_state
-
-        txt = f"Traffic Light: {tl_state} (last conf={self._last_tl_conf:.2f})"
-        cv2.rectangle(annotated, (10, annotated.shape[0] - 40),
-                      (10 + 300, annotated.shape[0] - 10), (255, 255, 255), -1)
-        cv2.putText(annotated, txt, (15, annotated.shape[0] - 18),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 2)
+            x1,y1,x2,y2 = v['bbox']
+            cv2.putText(annotated, v['type'].upper(), (x1, max(20,y1-35)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,0,255), 2)
 
         return annotated, dets, tracked_list, violations, tl_state

@@ -1,19 +1,44 @@
-# dependencies
-node_modules
+# Node dependencies
+node_modules/
 
-# build output
-dist
+# Build output
+dist/
+build/
 
-# local env files
+# Local environment files
 .env
+*.env
 
-# debug logs
+# Debug logs
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 
 # IDE / editor settings
-.vscode
-.idea
-"cv-module/snapshots/" 
-"cv-module/*.mp4" 
+.vscode/
+.idea/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Large ML models (avoid pushing)
+*.pt
+*.onnx
+*.pth
+*.weights
+
+# Media files (avoid large push)
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.jpg
+*.jpeg
+*.png
+
+# Project specific (traffic project)
+cv-module/snapshots/
+cv-module/tmp/

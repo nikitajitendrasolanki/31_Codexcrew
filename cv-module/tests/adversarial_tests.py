@@ -1,4 +1,3 @@
-# cv-module/tests/adversarial_tests.py
 import cv2, os, json, numpy as np
 from ultralytics import YOLO
 from pathlib import Path
@@ -7,13 +6,25 @@ from tqdm import tqdm
 # ---------------------------
 # Traffic-relevant classes
 # ---------------------------
-TRAFFIC_CLASSES = {"car", "motorbike", "bus", "truck", "bicycle", "traffic light", "person"}
+TRAFFIC_CLASSES = {
+    # Vehicles
+    "car", "motorbike", "bus", "truck", "bicycle",
+
+    # Human
+    "person",
+
+    # Signals / Signs
+    "traffic light", "stop sign",
+
+    # Rail transport
+    "train"
+}
 
 def classify_content(detected_classes):
     """
     Classify content type:
     - "traffic": contains valid traffic classes
-    - "invalid": no traffic classes, but some other detections
+    - "invalid": only irrelevant detections (animals, objects, etc.)
     - "unclear": nothing detected (likely blur/dark/low quality)
     """
     if not detected_classes:
@@ -112,14 +123,14 @@ def run_tests(model_path, images_dir, out_json="adv_results.json"):
         if content_type == "invalid":
             results[str(img_path.name)] = {
                 "status": "invalid",
-                "message": "⚠️ Non-traffic content detected. Skipping adversarial tests."
+                "message": "⚠️ Non-traffic content detected (animals / irrelevant objects). Skipping."
             }
             continue
 
         if content_type == "unclear":
             results[str(img_path.name)] = {
                 "status": "unclear",
-                "message": "⚠️ Traffic image too unclear for analysis. Please upload a clearer picture."
+                "message": "⚠️ Image too unclear (no detections). Please provide clearer traffic footage."
             }
             continue
 

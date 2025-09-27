@@ -14,3 +14,5 @@ lime              # optional
 reportlab         # to create PDFs
 imgaug            # augmentations
 tqdm
+pymongo
+python-dotenv

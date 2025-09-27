@@ -1,352 +1,228 @@
-# rule_engine.py
-"""
-RuleEngine: traffic rule checks
-
-- Invalid input checks (dark/static/too few detections)
-- Red-light jump (uses traffic light detection or stop_line_y)
-- Wrong-way (uses allowed_direction vector; auto-calibrator should set it)
-- Overspeed (uses velocity_kmph if provided; otherwise converts pix/sec -> km/h if meters_per_pixel present)
-- No-helmet (prefers detector-provided `obj['helmet']`, falls back to safer heuristic)
-- Each violation dict includes: type, track_id, bbox, cls, conf, optional: speed_kmph, plate, reason, tl_state
-"""
-
+# rule_engine.py (FINAL MERGED FIXED)
 import time
 import cv2
 import numpy as np
-from utils import save_snapshot
+
 
 class RuleEngine:
-    def __init__(self):
-        # calibration / config (can be set from detector/autocalibrator)
-        self.speed_limit = 50.0          # km/h default (override per-camera)
-        self.allowed_direction = None    # (dx, dy) vector; calibrator should set this
-        self.meters_per_pixel = None     # set by calibrator (meters / pixel)
-        self.stop_line_y = None          # optional stop line pixel y-coordinate
-
-        # input validation helpers
-        self.invalid_frames_buffer = []
-        self.prev_frame = None
-        self.static_frame_count = 0
+    def __init__(self, db_conn=None):
+        # --- Config defaults ---
+        self.speed_limit = 50.0
+        self.allowed_direction = (0, 1)   # default downward direction
+        self.meters_per_pixel = 0.05
+        self.stop_line_y = 400
         self.MIN_DETECTIONS = 1
 
-        # cooldown to avoid spamming same track
+        # --- Cooldown ---
         self.last_violation_time = {}
+        self.violation_cooldown_s = 6
 
-    def _is_frame_dark(self, frame):
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        return np.mean(gray) < 20
+        # --- Train/track ---
+        self.train_barrier_down = True
+        self.train_zone = (250, 600)
+        self.platform_zones = []   # zebra-cross ignore zone
+        self.db_conn = db_conn
 
-    def _is_static(self, frame):
-        if self.prev_frame is None:
-            self.prev_frame = frame.copy()
+        # --- Traffic light ---
+        self._last_tl_state = "UNKNOWN"
+        self._ema_red, self._ema_green, self._ema_yellow = 0.0, 0.0, 0.0
+        self._alpha = 0.35
+
+    # ----------------------
+    # Utils
+    # ----------------------
+    def _cooldown_ok(self, track_id, vtype):
+        key = (track_id, vtype)
+        last = self.last_violation_time.get(key, 0)
+        if time.time() - last < self.violation_cooldown_s:
             return False
-        prev_gray = cv2.cvtColor(self.prev_frame, cv2.COLOR_BGR2GRAY)
-        cur_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        diff = cv2.absdiff(prev_gray, cur_gray)
-        non_zero = np.count_nonzero(diff)
-        self.prev_frame = frame.copy()
-        return non_zero < 1000
+        self.last_violation_time[key] = time.time()
+        return True
 
     def check_invalid_input(self, frame, tracked_objects):
-        # dark
-        if self._is_frame_dark(frame):
-            return True, "frame_too_dark"
-        # static
-        if self._is_static(frame):
-            self.static_frame_count += 1
-            if self.static_frame_count > 30:
-                return True, "video_static"
-        else:
-            self.static_frame_count = 0
-        # too few detections over short time
+        try:
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            if np.mean(gray) < 18:
+                return True, "frame_too_dark"
+        except Exception:
+            return False, None
         if len(tracked_objects) < self.MIN_DETECTIONS:
-            self.invalid_frames_buffer.append(time.time())
-            self.invalid_frames_buffer = [t for t in self.invalid_frames_buffer if time.time()-t < 5.0]
-            if len(self.invalid_frames_buffer) > 8:
-                return True, "too_few_detections"
-        else:
-            self.invalid_frames_buffer = []
+            return True, "too_few_detections"
         return False, None
 
+    # ----------------------
+    # Traffic Light Detection
+    # ----------------------
     def _get_traffic_light_state(self, frame, tracked_objects):
-        # Keep original traffic-light HSV heuristic
-        for obj in tracked_objects:
-            name = obj.get('cls_name','').lower() if obj.get('cls_name') else ''
-            if 'traffic' in name and 'light' in name:
-                x1,y1,x2,y2 = obj['bbox']
-                crop = frame[max(0,y1):max(0,y2), max(0,x1):max(0,x2)]
-                if crop.size == 0: 
-                    continue
-                hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
-                lower_red1 = np.array([0, 120, 70]); upper_red1 = np.array([10, 255, 255])
-                lower_red2 = np.array([170,120,70]); upper_red2 = np.array([180,255,255])
-                mask1 = cv2.inRange(hsv, lower_red1, upper_red1)
-                mask2 = cv2.inRange(hsv, lower_red2, upper_red2)
-                red_percent = (np.count_nonzero(mask1)+np.count_nonzero(mask2)) / (crop.shape[0]*crop.shape[1] + 1e-6)
-                lower_green = np.array([36, 50, 50]); upper_green = np.array([89, 255, 255])
-                maskg = cv2.inRange(hsv, lower_green, upper_green)
-                green_percent = np.count_nonzero(maskg)/(crop.shape[0]*crop.shape[1] + 1e-6)
-                if red_percent > 0.02 and red_percent > green_percent:
-                    return 'red'
-                if green_percent > 0.02 and green_percent > red_percent:
-                    return 'green'
-        return 'unknown'
+        tl_dets = [o for o in tracked_objects
+                   if (o.get("cls_name") or "").lower() == "traffic light"
+                   and o.get("conf", 0) > 0.3]
+        if not tl_dets:
+            return self._last_tl_state
 
-    def _helmet_heuristic(self, frame, motorbike_obj, all_tracked):
-        """
-        Safer fallback helmet heuristic — returns (helmet_ok:bool, reason:str)
-        Important: DO NOT apply this to plain 'person' objects; only to motorbike objects
-        """
-        x1,y1,x2,y2 = motorbike_obj.get('bbox', (0,0,0,0))
-        # find person candidate overlapping the bike bbox
-        candidates = []
-        for obj in all_tracked:
-            if obj.get('cls_name') and obj['cls_name'].lower() == 'person':
-                cx,cy = obj.get('centroid', (None,None))
-                if cx is None: continue
-                # require centroid strictly inside or slightly above the vehicle bbox (reduces false positives)
-                if (x1 - 5) <= cx <= (x2 + 5) and (y1 - 40) <= cy <= (y2 + 20):
-                    candidates.append(obj)
-        if not candidates:
-            return True, "no_rider_detected"  # assume no rider, so not a helmet violation
-        rider = candidates[0]
-        rx1,ry1,rx2,ry2 = rider.get('bbox', (0,0,0,0))
-        h = ry2 - ry1
-        head_y1 = ry1
-        head_y2 = ry1 + max(8, int(0.25 * h))
-        head = frame[max(0,head_y1):max(0,head_y2), max(0,rx1):max(0,rx2)]
-        if head.size == 0:
-            return False, "head_crop_empty"
-        hsv = cv2.cvtColor(head, cv2.COLOR_BGR2HSV)
-        # helmet-like colors heuristic
-        mask_yellow = cv2.inRange(hsv, np.array([15,80,80]), np.array([40,255,255]))
-        mask_white = cv2.inRange(hsv, np.array([0,0,200]), np.array([180,40,255]))
-        mask_blue = cv2.inRange(hsv, np.array([90,50,50]), np.array([140,255,255]))
-        mask_red1 = cv2.inRange(hsv, np.array([0,120,70]), np.array([10,255,255]))
-        mask_red2 = cv2.inRange(hsv, np.array([170,120,70]), np.array([180,255,255]))
-        detected_pct = (np.count_nonzero(mask_yellow) + np.count_nonzero(mask_white) +
-                        np.count_nonzero(mask_blue) + np.count_nonzero(mask_red1) + np.count_nonzero(mask_red2)) / (head.shape[0]*head.shape[1] + 1e-6)
-        if detected_pct > 0.04:
-            return True, "helmet_likely"
-        else:
-            return False, "helmet_unlikely"
+        tl_det = max(tl_dets, key=lambda x: x.get("conf", 0))
+        x1, y1, x2, y2 = map(int, tl_det.get("bbox", (0, 0, 0, 0)))
+        h, w = frame.shape[:2]
+        x1, y1, x2, y2 = max(0, x1), max(0, y1), min(w, x2), min(h, y2)
+        crop = frame[y1:y2, x1:x2]
+        if crop.size == 0:
+            return self._last_tl_state
 
-    def _too_old_violation(self, track_id, cooldown=5.0):
-        t = self.last_violation_time.get(track_id, 0)
-        if time.time() - t < cooldown:
-            return True
-        self.last_violation_time[track_id] = time.time()
+        hsv = cv2.cvtColor(cv2.GaussianBlur(crop, (5, 5), 0), cv2.COLOR_BGR2HSV)
+        total = crop.shape[0] * crop.shape[1] + 1e-9
+
+        r1 = cv2.inRange(hsv, (0, 80, 70), (10, 255, 255))
+        r2 = cv2.inRange(hsv, (170, 80, 70), (180, 255, 255))
+        g = cv2.inRange(hsv, (36, 50, 50), (90, 255, 255))
+        y = cv2.inRange(hsv, (18, 80, 80), (35, 255, 255))
+
+        red_ratio = (np.count_nonzero(r1) + np.count_nonzero(r2)) / total
+        green_ratio = np.count_nonzero(g) / total
+        yellow_ratio = np.count_nonzero(y) / total
+
+        self._ema_red = self._alpha * red_ratio + (1 - self._alpha) * self._ema_red
+        self._ema_green = self._alpha * green_ratio + (1 - self._alpha) * self._ema_green
+        self._ema_yellow = self._alpha * yellow_ratio + (1 - self._alpha) * self._ema_yellow
+
+        state = "UNKNOWN"
+        if self._ema_red > 0.06 and self._ema_red > self._ema_green and self._ema_red > self._ema_yellow:
+            state = "RED"
+        elif self._ema_green > 0.06 and self._ema_green > self._ema_red:
+            state = "GREEN"
+        elif self._ema_yellow > 0.04 and self._ema_yellow > self._ema_red:
+            state = "YELLOW"
+
+        self._last_tl_state = state
+        return state
+
+    def _inside_platform_zones(self, x, y):
+        for (x1, y1, x2, y2) in self.platform_zones:
+            if x1 <= x <= x2 and y1 <= y <= y2:
+                return True
         return False
 
-    def _obj_speed_kmph(self, obj):
-        """
-        Compute object's speed in km/h using available fields:
-         - prefer obj['velocity_kmph'] (detector may supply)
-         - else if obj['velocity'] (pix/sec) and self.meters_per_pixel known -> convert
-         - else return None
-        """
-        if obj is None:
-            return None
-        if 'velocity_kmph' in obj and obj['velocity_kmph'] is not None:
-            try:
-                return float(obj['velocity_kmph'])
-            except Exception:
-                pass
-        v_pix = obj.get('velocity')
-        if v_pix is None:
-            return None
-        if self.meters_per_pixel is not None:
-            try:
-                # pix/sec -> meters/sec -> km/h
-                kmph = float(v_pix) * float(self.meters_per_pixel) * 3.6
-                return kmph
-            except Exception:
-                return None
-        return None
+    # ----------------------
+    # Helmet Detection
+    # ----------------------
+    def _helmet_check_for_bike(self, frame, bike_obj, all_tracked):
+        x1, y1, x2, y2 = bike_obj.get("bbox", (0, 0, 0, 0))
+        pad_w, pad_h = int((x2 - x1) * 0.25), int((y2 - y1) * 0.4)
+        ex1, ey1, ex2, ey2 = x1 - pad_w, y1 - pad_h, x2 + pad_w, y2 + pad_h
 
-    def _is_wrong_way(self, obj):
-        """
-        Determine wrong-way:
-         - Requires allowed_direction to be set (vector)
-         - Uses object's centroid history to compute movement vector
-         - If movement vector is sufficiently opposite to allowed_direction, mark wrong-way
-        """
-        if self.allowed_direction is None:
-            return False
-        history = obj.get('history', [])
-        if not history or len(history) < 3:
-            return False
-        # take coarse vector (first -> last of history window)
-        x0,y0 = history[0]
-        x1,y1 = history[-1]
-        dx = x1 - x0
-        dy = y1 - y0
-        mag = (dx*dx + dy*dy)**0.5
-        if mag < 2.0:
-            return False
-        adx, ady = self.allowed_direction
-        amag = (adx*adx + ady*ady)**0.5 + 1e-9
-        cosang = (dx*adx + dy*ady) / (mag * amag)
-        # cosang near -1 means opposite; threshold tuned to -0.5
-        return cosang < -0.5
+        candidates = [o for o in all_tracked
+                      if (o.get("cls_name") or "").lower() == "person"
+                      and o.get("centroid", (9999, 9999))[0] is not None
+                      and ex1 <= o["centroid"][0] <= ex2
+                      and ey1 <= o["centroid"][1] <= ey2]
+        if not candidates:
+            return "unknown"
 
-    def check(self, frame, tracked_objects, db_conn=None):
-        """
-        Main entrypoint. Returns list of violation dicts.
-        Each violation dict includes at least:
-          {'type','track_id','bbox','cls','conf', ...}
-        """
+        rider = candidates[0]
+        rx1, ry1, rx2, ry2 = rider.get("bbox", (0, 0, 0, 0))
+        rh = ry2 - ry1
+        if rh <= 0:
+            return "unknown"
+
+        head_y1, head_y2 = ry1, ry1 + max(8, int(0.25 * rh))
+        hcrop = frame[max(0, head_y1):max(0, head_y2), max(0, rx1):max(0, rx2)]
+        if hcrop.size == 0:
+            return "unknown"
+
+        hsv = cv2.cvtColor(hcrop, cv2.COLOR_BGR2HSV)
+        masks = [
+            cv2.inRange(hsv, (0, 0, 170), (180, 40, 255)),
+            cv2.inRange(hsv, (15, 90, 90), (40, 255, 255)),
+            cv2.inRange(hsv, (90, 50, 50), (140, 255, 255)),
+        ]
+        detected = sum(np.count_nonzero(m) for m in masks)
+        pct = detected / (hcrop.shape[0] * hcrop.shape[1] + 1e-9)
+
+        if pct < 0.02:
+            return "no_helmet"
+        elif pct > 0.04:
+            return "helmet"
+        return "unknown"
+
+    # ----------------------
+    # Main check()
+    # ----------------------
+    def check(self, frame, tracked_objects):
         violations = []
 
-        # invalid input guard
         invalid, reason = self.check_invalid_input(frame, tracked_objects)
         if invalid:
-            return [{'type': 'invalid_input', 'reason': reason}]
+            return [{"type": "invalid_input", "reason": reason}]
 
-        # traffic light state (detector or this engine can detect)
         tl_state = self._get_traffic_light_state(frame, tracked_objects)
 
         for obj in tracked_objects:
-            tid = obj.get('track_id', -1)
-            cls_name = (obj.get('cls_name') or '').lower()
-            bbox = obj.get('bbox')
-            conf = obj.get('conf', 0.0)
-            plate = obj.get('plate') or None
+            tid = obj.get("track_id")
+            cls_name = str(obj.get("cls_name") or obj.get("cls") or "vehicle").lower()
+            bbox = obj.get("bbox")
+            centroid = obj.get("centroid", (0, 0))
+            speed = obj.get("velocity_kmph") or obj.get("speed_kmph") or 0.0
+            conf = round(float(obj.get("conf", 0.0)), 2)
 
-            # compute speed in km/h (if possible)
-            speed_kmph = self._obj_speed_kmph(obj)
+            # overspeed
+            if speed and speed > self.speed_limit and self._cooldown_ok(tid, "overspeed"):
+                violations.append({
+                    "type": "overspeed",
+                    "reason": f"Speed {speed:.1f} > {self.speed_limit}",
+                    "track_id": tid, "cls": cls_name, "conf": conf,
+                    "speed_kmph": float(speed), "bbox": bbox, "tl_state": tl_state
+                })
 
-            # 1) RED LIGHT JUMP: only if traffic light is red
-            if tl_state == 'red':
-                # prefer configured stop_line_y if provided
-                if self.stop_line_y is not None:
-                    cy = obj.get('centroid', (0,0))[1]
-                    # crossing logic: if centroid is past stop_line (y smaller or larger depending camera)
-                    # assume stop_line_y is y-coordinate below light; use simple check: centroid above line -> crossed
-                    if cy is not None and cy < self.stop_line_y:
-                        if not self._too_old_violation(tid):
-                            v = {
-                                'type': 'red_light_jump',
-                                'track_id': tid,
-                                'bbox': bbox,
-                                'cls': cls_name,
-                                'conf': conf,
-                                'tl_state': tl_state,
-                                'plate': plate
-                            }
-                            violations.append(v)
-                            save_snapshot(frame, f"red_light_{cls_name}_{tid}")
-                else:
-                    # heuristic: if traffic light detected in frame, we consider objects that moved into the intersection area near light
-                    tl_boxes = [t for t in tracked_objects if t.get('cls_name') and 'traffic' in t['cls_name'].lower()]
-                    if len(tl_boxes) > 0:
-                        tlx1, tly1, tlx2, tly2 = tl_boxes[0].get('bbox', (0,0,0,0))
-                        stop_y = tly2 + 30
-                        cy = obj.get('centroid', (0,0))[1]
-                        if cy is not None and cy < stop_y:
-                            if not self._too_old_violation(tid):
-                                v = {
-                                    'type': 'red_light_jump',
-                                    'track_id': tid,
-                                    'bbox': bbox,
-                                    'cls': cls_name,
-                                    'conf': conf,
-                                    'tl_state': tl_state,
-                                    'plate': plate
-                                }
-                                violations.append(v)
-                                save_snapshot(frame, f"red_light_{cls_name}_{tid}")
+            # signal jump
+            if self.stop_line_y and tl_state == "RED":
+                cy = centroid[1]
+                if cy and cy < self.stop_line_y and self._cooldown_ok(tid, "signal_jump"):
+                    violations.append({
+                        "type": "signal_jump",
+                        "reason": f"Crossed stop line at y={cy}",
+                        "track_id": tid, "cls": cls_name,
+                        "bbox": bbox, "tl_state": "RED"
+                    })
 
-            # 2) WRONG WAY: compare trajectory to allowed_direction (if set)
-            try:
-                if self._is_wrong_way(obj):
-                    if not self._too_old_violation(tid):
-                        v = {
-                            'type': 'wrong_way',
-                            'track_id': tid,
-                            'bbox': bbox,
-                            'cls': cls_name,
-                            'conf': conf,
-                            'plate': plate
-                        }
-                        violations.append(v)
-                        save_snapshot(frame, f"wrong_way_{cls_name}_{tid}")
-            except Exception:
-                # safety: ignore errors in wrong-way calc
-                pass
+            # helmet
+            if cls_name in ("motorbike", "motorcycle"):
+                helmet_state = self._helmet_check_for_bike(frame, obj, tracked_objects)
+                if helmet_state == "no_helmet" and self._cooldown_ok(tid, "no_helmet"):
+                    violations.append({
+                        "type": "no_helmet",
+                        "reason": "Rider without helmet",
+                        "track_id": tid, "cls": cls_name,
+                        "bbox": bbox, "tl_state": tl_state
+                    })
 
-            # 3) OVERSPEED: use speed_kmph if available (recommended)
-            try:
-                if speed_kmph is not None:
-                    if speed_kmph > float(self.speed_limit):
-                        if not self._too_old_violation(tid):
-                            v = {
-                                'type': 'overspeed',
-                                'track_id': tid,
-                                'bbox': bbox,
-                                'cls': cls_name,
-                                'conf': conf,
-                                'speed_kmph': round(speed_kmph, 1),
-                                'plate': plate
-                            }
-                            violations.append(v)
-                            save_snapshot(frame, f"overspeed_{cls_name}_{tid}")
-                else:
-                    # fallback: detector may provide pixel/sec speed and rule_engine may have overspeed_pix_per_sec
-                    pix_v = obj.get('velocity')
-                    if pix_v is not None and hasattr(self, 'overspeed_pix_per_sec') and self.overspeed_pix_per_sec:
-                        if pix_v > self.overspeed_pix_per_sec:
-                            if not self._too_old_violation(tid):
-                                v = {
-                                    'type': 'overspeed',
-                                    'track_id': tid,
-                                    'bbox': bbox,
-                                    'cls': cls_name,
-                                    'conf': conf,
-                                    'speed_px_s': pix_v,
-                                    'plate': plate
-                                }
-                                violations.append(v)
-                                save_snapshot(frame, f"overspeed_px_{cls_name}_{tid}")
-            except Exception:
-                pass
+            # wrong way
+            vel = obj.get("velocity")
+            if vel and self.allowed_direction:
+                try:
+                    vx, vy = vel if isinstance(vel, (list, tuple)) else (float(vel), 0.0)
+                    adx, ady = self.allowed_direction
+                    if adx * vx + ady * vy < 0 and self._cooldown_ok(tid, "wrong_direction"):
+                        violations.append({
+                            "type": "wrong_direction",
+                            "reason": f"Opposite direction (vel: {vx:.1f},{vy:.1f})",
+                            "track_id": tid, "cls": cls_name,
+                            "bbox": bbox, "tl_state": tl_state
+                        })
+                except Exception:
+                    pass
 
-            # 4) NO HELMET: only for motorbike/motorcycle class — prefer detector-provided obj['helmet']
-            try:
-                if 'motor' in cls_name:
-                    helmet_flag = obj.get('helmet', None)
-                    if helmet_flag is False:
-                        # explicit no helmet detected by detector or heuristic
-                        if not self._too_old_violation(tid):
-                            v = {
-                                'type': 'no_helmet',
-                                'track_id': tid,
-                                'bbox': bbox,
-                                'cls': cls_name,
-                                'conf': conf,
-                                'reason': 'helmet_detector',
-                                'plate': plate
-                            }
-                            violations.append(v)
-                            save_snapshot(frame, f"nohelmet_{cls_name}_{tid}")
-                    elif helmet_flag is None:
-                        # fallback heuristic (safer): run rule_engine's helmet heuristic which may return (True/False)
-                        ok, reason = self._helmet_heuristic(frame, obj, tracked_objects)
-                        # only if definitely no helmet we mark violation
-                        if ok is False:
-                            if not self._too_old_violation(tid):
-                                v = {
-                                    'type': 'no_helmet',
-                                    'track_id': tid,
-                                    'bbox': bbox,
-                                    'cls': cls_name,
-                                    'conf': conf,
-                                    'reason': reason,
-                                    'plate': plate
-                                }
-                                violations.append(v)
-                                save_snapshot(frame, f"nohelmet_{cls_name}_{tid}")
-            except Exception:
-                pass
+        # train crossing
+        if self.train_barrier_down and self.train_zone:
+            y1, y2 = self.train_zone
+            for obj in tracked_objects:
+                if (obj.get("cls_name") or "").lower() == "person":
+                    cx, cy = obj.get("centroid", (None, None))
+                    if cx and y1 <= cy <= y2 and not self._inside_platform_zones(cx, cy):
+                        if self._cooldown_ok(obj.get("track_id"), "track_crossing"):
+                            violations.append({
+                                "type": "track_crossing",
+                                "reason": "Person in train zone while barrier down",
+                                "track_id": obj.get("track_id"), "cls": "person",
+                                "bbox": obj.get("bbox"), "tl_state": "TRAIN_ZONE"
+                            })
 
         return violations

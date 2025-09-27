@@ -1,70 +1,60 @@
 # utils.py
-import os, time, sqlite3, json
+import os
 import cv2
 from datetime import datetime
 
 SNAPSHOT_DIR = "snapshots"
-DB_PATH = "violations.db"
+MODEL_DIR = "models"
 
+DB_PATH = "violations.db"  # left for legacy if someone still expects a file path (not used now)
 
 def ensure_dirs():
     os.makedirs(SNAPSHOT_DIR, exist_ok=True)
-    os.makedirs(".streamlit", exist_ok=True)  # harmless if exists
+    os.makedirs(MODEL_DIR, exist_ok=True)
 
-
-def init_db(db_path=None):
-    db_path = db_path or os.path.join("cv-module", DB_PATH) if os.path.exists("cv-module") else DB_PATH
-    conn = sqlite3.connect(db_path, check_same_thread=False)
-    c = conn.cursor()
-    c.execute('''
-    CREATE TABLE IF NOT EXISTS violations (
-        id INTEGER PRIMARY KEY,
-        ts TEXT,
-        type TEXT,
-        file TEXT,
-        conf REAL,
-        track_id INTEGER,
-        extra TEXT
-    )
-    ''')
-    conn.commit()
-    return conn
-
-
-def save_snapshot(frame, violation_text, vdict=None):
+def save_snapshot(frame, vtype, vdict=None):
     """
-    Save annotated snapshot for a violation and return filename.
-    If vdict provided, injects 'file' key.
+    Save the full frame (or annotated crop if caller wants) and return filepath.
+    vdict optional (used to construct filename).
     """
-    ensure_dirs()
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = f"{SNAPSHOT_DIR}/{violation_text}_{ts}.jpg"
+    tid = vdict.get("track_id") if isinstance(vdict, dict) else "NA"
+    fname = f"{SNAPSHOT_DIR}/{ts}_{vtype}_tid{tid}.jpg"
+    try:
+        cv2.imwrite(fname, frame)
+        return fname
+    except Exception as e:
+        print("[SAVE SNAPSHOT ERROR]", e)
+        return None
 
-    ann = frame.copy()
-    cv2.putText(ann, violation_text, (10, 30),
-                cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
-    cv2.imwrite(filename, ann)
-
-    if vdict is not None:
-        vdict['file'] = filename
-    return filename
-
-
-def log_violation_db(conn, vdict):
+def init_db():
     """
-    Store violation in SQLite DB.
+    helper to return the mongo collection if db.py provides it.
+    call this at startup: coll = init_db()
     """
-    if conn is None:
-        return
-    c = conn.cursor()
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    vtype = vdict.get('type', 'unknown')
-    file = vdict.get('file', '')
-    conf = float(vdict.get('conf', 0.0))
-    track_id = int(vdict.get('track_id', -1))
-    extra = json.dumps(vdict)
-    c.execute(
-        "INSERT INTO violations(ts,type,file,conf,track_id,extra) VALUES(?,?,?,?,?,?)",
-        (ts, vtype, file, conf, track_id, extra),
-    )
-    conn.commit()
+    try:
+        import db
+        return db.init_db()
+    except Exception as e:
+        print("[UTILS:init_db] cannot init mongo collection:", e)
+        return None
+
+def log_violation_db(conn, record):
+    """
+    Backwards-compatible helper used in streamlit code.
+    If conn is a pymongo Collection -> insert_one
+    If conn is None -> fallback to db.insert_violation
+    """
+    try:
+        if conn is not None and hasattr(conn, "insert_one"):
+            conn.insert_one(record)
+            return
+    except Exception as e:
+        print("[log_violation_db] insert via conn failed:", e)
+
+    # fallback - try to use db.insert_violation
+    try:
+        import db
+        db.insert_violation(record)
+    except Exception as e:
+        print("[log_violation_db] fallback db.insert_violation failed:", e)
