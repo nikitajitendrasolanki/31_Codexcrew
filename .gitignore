@@ -37,7 +37,7 @@ __pycache__/
 *.mkv
 *.jpg
 *.jpeg
-*.png
+
 
 # Project specific (traffic project)
 cv-module/snapshots/

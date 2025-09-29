@@ -1,7 +1,15 @@
 import React, { useEffect, useState } from "react";
 import { fetchAudit } from "../services/api";
 import { Card, CardContent } from "../components/Card";
-import { BarChart, Bar, XAxis, YAxis, Tooltip, Legend, ResponsiveContainer } from "recharts";
+import {
+  BarChart,
+  Bar,
+  XAxis,
+  YAxis,
+  Tooltip,
+  Legend,
+  ResponsiveContainer,
+} from "recharts";
 
 export default function AuditReport() {
   const [audit, setAudit] = useState(null);
@@ -15,7 +23,7 @@ export default function AuditReport() {
       const data = await fetchAudit();
       setAudit(data);
     } catch (err) {
-      setError("Failed to load audit report");
+      setError("⚠️ Failed to load audit report");
     } finally {
       if (isFirst) setInitialLoading(false);
       setRefreshing(false);
@@ -49,20 +57,31 @@ export default function AuditReport() {
     }
   };
 
-  if (initialLoading) return <p className="text-center text-gray-300">Loading audit report...</p>;
-  if (error) return <p className="text-red-500 text-center">{error}</p>;
+  if (initialLoading)
+    return (
+      <p className="text-center text-gray-400 animate-pulse">
+        ⏳ Loading audit report...
+      </p>
+    );
+  if (error) return <p className="text-red-400 text-center">{error}</p>;
   if (!audit) return null;
 
   return (
-    <div className="p-6 space-y-6 text-gray-200 bg-gray-950 min-h-screen">
+    <div className="p-6 space-y-8 bg-gradient-to-br from-gray-950 via-gray-900 to-black min-h-screen text-gray-200">
       {/* Header */}
-      <div className="flex justify-between items-center">
-        <h2 className="text-2xl font-bold text-white">📊 Audit Report</h2>
-        <div className="flex gap-3 items-center">
-          {refreshing && <span className="text-sm text-gray-400">🔄 Updating...</span>}
+      <div className="flex justify-between items-center border-b border-gray-800 pb-4">
+        <h2 className="text-3xl font-extrabold text-primary drop-shadow">
+          📊 Audit Report
+        </h2>
+        <div className="flex gap-4 items-center">
+          {refreshing && (
+            <span className="text-sm text-gray-400 animate-pulse">
+              🔄 Updating...
+            </span>
+          )}
           <button
             onClick={downloadPDF}
-            className="px-3 py-2 bg-primary rounded-lg shadow hover:bg-primary/80 transition"
+            className="px-4 py-2 bg-gradient-to-r from-primary to-blue-500 rounded-xl shadow-lg hover:opacity-90 transition-all duration-200"
           >
             ⬇ Export PDF
           </button>
@@ -70,19 +89,23 @@ export default function AuditReport() {
       </div>
 
       {/* Model Info + Robustness */}
-      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-        <Card className="bg-gray-900 text-gray-200">
-          <CardContent className="p-4">
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+        <Card className="bg-gray-900/80 backdrop-blur-xl border border-gray-700 shadow-lg rounded-2xl">
+          <CardContent className="p-5 space-y-2">
             <h3 className="text-lg font-semibold text-primary">🧠 Model Info</h3>
-            <p><b>Model:</b> {audit.model}</p>
-            <p><b>Date:</b> {new Date(audit.date).toLocaleString()}</p>
+            <p>
+              <b>Model:</b> {audit.model}
+            </p>
+            <p>
+              <b>Date:</b> {new Date(audit.date).toLocaleString()}
+            </p>
           </CardContent>
         </Card>
 
-        <Card className="bg-gray-900 text-gray-200">
-          <CardContent className="p-4">
+        <Card className="bg-gray-900/80 backdrop-blur-xl border border-gray-700 shadow-lg rounded-2xl">
+          <CardContent className="p-5 space-y-2">
             <h3 className="text-lg font-semibold text-primary">🛡️ Robustness</h3>
-            <pre className="text-sm bg-gray-800 text-gray-300 p-2 rounded max-h-40 overflow-y-auto">
+            <pre className="text-sm bg-gray-800 text-gray-300 p-3 rounded-lg max-h-40 overflow-y-auto">
               {audit.adv_summary}
             </pre>
           </CardContent>
@@ -90,71 +113,85 @@ export default function AuditReport() {
       </div>
 
       {/* Metrics */}
-      <Card className="bg-gray-900 text-gray-200">
-        <CardContent className="p-4">
-          <h3 className="text-lg font-semibold mb-2 text-primary">📈 Per-class Metrics</h3>
-          <ResponsiveContainer width="100%" height={300}>
+      <Card className="bg-gray-900/80 backdrop-blur-xl border border-gray-700 shadow-lg rounded-2xl">
+        <CardContent className="p-5">
+          <h3 className="text-lg font-semibold mb-3 text-primary">
+            📈 Per-class Metrics
+          </h3>
+          <ResponsiveContainer width="100%" height={320}>
             <BarChart data={audit.metrics}>
-              <XAxis dataKey="class" stroke="#ccc" />
-              <YAxis stroke="#ccc" />
-              <Tooltip contentStyle={{ backgroundColor: "#1f2937", color: "#fff" }} />
+              <XAxis dataKey="class" stroke="#aaa" />
+              <YAxis stroke="#aaa" />
+              <Tooltip contentStyle={{ backgroundColor: "#111827", color: "#fff" }} />
               <Legend />
-              <Bar dataKey="precision" fill="#4ade80" />
-              <Bar dataKey="recall" fill="#60a5fa" />
-              <Bar dataKey="f1" fill="#facc15" />
+              <Bar dataKey="precision" fill="#34d399" radius={[6, 6, 0, 0]} />
+              <Bar dataKey="recall" fill="#60a5fa" radius={[6, 6, 0, 0]} />
+              <Bar dataKey="f1" fill="#fbbf24" radius={[6, 6, 0, 0]} />
             </BarChart>
           </ResponsiveContainer>
         </CardContent>
       </Card>
 
       {/* Violations */}
-      <Card className="bg-gray-900 text-gray-200">
-        <CardContent className="p-4">
-          <h3 className="text-lg font-semibold mb-2 text-primary">🚦 Violations Log</h3>
+      <Card className="bg-gray-900/80 backdrop-blur-xl border border-gray-700 shadow-lg rounded-2xl">
+        <CardContent className="p-5">
+          <h3 className="text-lg font-semibold mb-3 text-primary">
+            🚦 Violations Log
+          </h3>
           {audit.violations.length === 0 ? (
-            <p className="text-gray-400">No violations recorded ✅</p>
+            <p className="text-gray-400">✅ No violations recorded</p>
           ) : (
-            <table className="w-full border-collapse border border-gray-700">
-              <thead>
-                <tr className="bg-gray-800 text-gray-200">
-                  <th className="border p-2">Type</th>
-                  <th className="border p-2">Vehicle</th>
-                  <th className="border p-2">Time</th>
-                  <th className="border p-2">Reason</th>
-                  <th className="border p-2">Confidence</th>
-                </tr>
-              </thead>
-              <tbody>
-                {audit.violations.map((v, i) => (
-                  <tr key={i} className="text-center hover:bg-gray-800">
-                    <td className="border p-2">{v.violation_type || "Unknown"}</td>
-                    <td className="border p-2">{v.vehicle_no || "N/A"}</td>
-                    <td className="border p-2">{v.timestamp || "N/A"}</td>
-                    <td className="border p-2">{v.reason || "-"}</td>
-                    <td className="border p-2">{v.conf || 0}</td>
+            <div className="overflow-x-auto">
+              <table className="w-full border-collapse border border-gray-700 text-sm">
+                <thead>
+                  <tr className="bg-gray-800/60 text-gray-300">
+                    <th className="border p-2">Type</th>
+                    <th className="border p-2">Vehicle</th>
+                    <th className="border p-2">Time</th>
+                    <th className="border p-2">Reason</th>
+                    <th className="border p-2">Confidence</th>
                   </tr>
-                ))}
-              </tbody>
-            </table>
+                </thead>
+                <tbody>
+                  {audit.violations.map((v, i) => (
+                    <tr
+                      key={i}
+                      className="text-center hover:bg-gray-800/60 transition"
+                    >
+                      <td className="border p-2">{v.violation_type || "Unknown"}</td>
+                      <td className="border p-2">{v.vehicle_no || "N/A"}</td>
+                      <td className="border p-2">{v.timestamp || "N/A"}</td>
+                      <td className="border p-2">{v.reason || "-"}</td>
+                      <td className="border p-2">{v.conf || 0}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
           )}
         </CardContent>
       </Card>
 
       {/* Examples */}
-      <Card className="bg-gray-900 text-gray-200">
-        <CardContent className="p-4">
-          <h3 className="text-lg font-semibold mb-2 text-primary">🖼️ Explainability Samples</h3>
+      <Card className="bg-gray-900/80 backdrop-blur-xl border border-gray-700 shadow-lg rounded-2xl">
+        <CardContent className="p-5">
+          <h3 className="text-lg font-semibold mb-3 text-primary">
+            🖼️ Explainability Samples
+          </h3>
           {audit.examples.length === 0 ? (
             <p className="text-gray-400">No examples available</p>
           ) : (
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
               {audit.examples.map((ex, i) => (
-                <div key={i} className="text-center">
-                  <p className="font-medium">{ex.title}</p>
+                <div
+                  key={i}
+                  className="text-center bg-gray-800/50 p-3 rounded-lg shadow"
+                >
+                  <p className="font-medium mb-2">{ex.title}</p>
                   <img
                     src={`http://127.0.0.1:8000/${ex.img}`}
                     alt={ex.title}
-                    className="rounded shadow-md mx-auto"
+                    className="rounded-lg shadow-lg mx-auto max-h-64 object-contain"
                   />
                 </div>
               ))}
