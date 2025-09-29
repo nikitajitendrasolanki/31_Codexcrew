@@ -5,7 +5,7 @@ import os
 # MongoDB Config
 # -------------------
 MONGO_URI = os.environ.get("MONGO_URI", "mongodb://localhost:27017")
-MONGO_DB = os.environ.get("MONGO_DB", "trafficdb")       # default trafficdb
+MONGO_DB = os.environ.get("MONGO_DB", "trafficdb")       # default DB
 VIOLATIONS_COLLECTION = "violations"
 REPORTS_COLLECTION = "reports"
 
@@ -32,10 +32,11 @@ except Exception as e:
 # Helper Functions
 # -------------------
 def init_db():
-    """Return violations collection (for backward compat)."""
+    """Return violations collection (for backward compatibility)."""
     return violations_col
 
 
+# ------------------- Violations -------------------
 def insert_violation(record: dict):
     """Insert a violation record."""
     try:
@@ -66,6 +67,7 @@ def get_all_violations(filter_query: dict = None, limit: int = 25):
         return []
 
 
+# ------------------- Audit Reports -------------------
 def insert_report(report: dict):
     """Insert an audit report."""
     try:
@@ -74,7 +76,7 @@ def insert_report(report: dict):
         print("[DB ERROR] insert_report failed:", e)
 
 
-def get_reports(limit: int = 25):
+def get_all_reports(limit: int = 25):
     """Fetch audit reports (latest first)."""
     try:
         return list(
@@ -83,5 +85,5 @@ def get_reports(limit: int = 25):
             .limit(limit)
         )
     except Exception as e:
-        print("[DB ERROR] get_reports failed:", e)
+        print("[DB ERROR] get_all_reports failed:", e)
         return []

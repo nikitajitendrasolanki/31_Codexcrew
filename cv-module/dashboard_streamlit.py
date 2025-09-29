@@ -1,11 +1,13 @@
 import streamlit as st
 import cv2, time, tempfile, os, sys
+import numpy as np
 import pandas as pd
 
+# Local imports
 from detector import TrafficDetector
-from db import insert_violation, get_all_violations, insert_report
+from db import insert_violation, insert_report
 
-# path fix
+# Path fix for cv-module
 sys.path.append(os.path.abspath("cv-module"))
 from audit import generate_report
 
@@ -25,7 +27,6 @@ def classify_content(detected_classes):
         return "traffic"
     return "invalid"
 
-
 # ---------------------------
 # Streamlit UI
 # ---------------------------
@@ -34,16 +35,22 @@ st.title("🚦 AI Traffic Violation Detection Dashboard")
 
 @st.cache_resource
 def get_detector():
-    return TrafficDetector("models/yolov8n.pt")
+    # ✅ Main traffic + plate detector
+    return TrafficDetector("models/yolov8n.pt", plate_model_path="models/plate_best.pt")
 
 detector = get_detector()
 
 # Sidebar controls
 st.sidebar.header("⚙️ Controls")
-source = st.sidebar.radio("Select Source", ["Webcam", "Video File"])
+source = st.sidebar.radio("Select Source", ["Webcam", "Video File", "Image File"])
+
 video_file = None
+image_file = None
+
 if source == "Video File":
     video_file = st.sidebar.file_uploader("Upload a video", type=["mp4", "avi", "mov"])
+elif source == "Image File":
+    image_file = st.sidebar.file_uploader("Upload an image", type=["jpg", "jpeg", "png"])
 
 start = st.sidebar.button("▶ Start Detection")
 stop = st.sidebar.button("⏹ Stop Detection")
@@ -78,7 +85,8 @@ try:
             if not cap.isOpened():
                 st.error("Couldn't open webcam.")
                 st.session_state.running = False
-        else:
+
+        elif source == "Video File":
             if video_file is None:
                 st.error("Please upload a video file to start detection.")
                 st.session_state.running = False
@@ -91,7 +99,26 @@ try:
                     st.error("Couldn't open uploaded video.")
                     st.session_state.running = False
 
-    # Detection Loop
+        elif source == "Image File":
+            if image_file is None:
+                st.error("Please upload an image file to start detection.")
+                st.session_state.running = False
+            else:
+                # Process single image
+                file_bytes = np.asarray(bytearray(image_file.read()), dtype=np.uint8)
+                frame = cv2.imdecode(file_bytes, 1)
+                annotated, dets, tracked_list, violations, tl_state = detector.detect_frame(frame)
+                annotated_rgb = cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB)
+                stframe.image(annotated_rgb, channels="RGB", use_container_width=True)
+
+                if violations:
+                    for v in violations:
+                        plate = v.get("plate", "NOT_DETECTED")
+                        violation_container.markdown(f"**{v['type']}** — Plate: {plate}")
+
+                st.session_state.running = False  # run once for image
+
+    # Detection Loop for webcam/video
     while st.session_state.running and cap and cap.isOpened():
         ret, frame = cap.read()
         if not ret:
@@ -105,25 +132,28 @@ try:
         # Content filter
         detected_classes = {d.get("cls_name", "unknown") for d in dets}
         content_type = classify_content(detected_classes)
-        if content_type == "invalid":
-            st.warning("⚠️ Non-traffic content detected. Skipping frame.")
-            continue
-        if content_type == "unclear":
-            st.info("⚠️ Frame unclear. Skipping frame.")
+        if content_type in ["invalid", "unclear"]:
             continue
 
         # Show video
         annotated_rgb = cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB)
-        stframe.image(annotated_rgb, channels="RGB", use_column_width=True)
+        stframe.image(annotated_rgb, channels="RGB", use_container_width=True)
 
+        # ---------------------------
         # Process Violations
+        # ---------------------------
         if violations:
             for v in violations:
                 vtype = v.get("type", "unknown")
                 plate = v.get("plate", "NOT_DETECTED")
                 tid = v.get("track_id", -1)
 
-                # Save to MongoDB
+                # 🔹 Snapshot save
+                os.makedirs("snapshots", exist_ok=True)
+                snapshot_name = f"snapshots/{time.strftime('%Y%m%d_%H%M%S')}_tid{tid}_{vtype}.jpg"
+                cv2.imwrite(snapshot_name, annotated)  # save annotated frame
+
+                # Save to MongoDB with snapshot_path
                 record = {
                     "vehicle_no": plate,
                     "violation_type": vtype,
@@ -133,7 +163,7 @@ try:
                     "speed_kmph": v.get("speed_kmph"),
                     "reason": v.get("reason", ""),
                     "tl_state": v.get("tl_state", tl_state),
-                    "snapshot_path": None,
+                    "snapshot_path": snapshot_name,
                     "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
                 }
                 try:
@@ -149,37 +179,24 @@ try:
                     "Track ID": tid,
                     "Confidence": round(record["conf"], 2),
                     "Speed": record["speed_kmph"],
+                    "Snapshot": snapshot_name,
                 })
 
-                # Show violation alert in sidebar
                 violation_container.markdown(
-                    f"**{vtype.upper()}** — {v.get('cls_name','?')} "
-                    f"(track {tid}, plate {plate})"
+                    f"**{vtype.upper()}** — {v.get('cls_name','?')} (plate {plate})"
+                )
+                violation_container.image(
+                    cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB),
+                    caption=f"Violation: {vtype} | Plate: {plate}",
+                    use_container_width=True
                 )
 
-            violation_container.image(
-                annotated_rgb,
-                caption=f"Detected Violations (frame at {time.strftime('%H:%M:%S')})",
-                use_container_width=True
-            )
-
-        # Traffic Light Status
-        if tl_state:
-            if tl_state.upper() == "RED":
-                violation_container.markdown("🚦 **Traffic Light:** 🟥 RED")
-            elif tl_state.upper() == "GREEN":
-                violation_container.markdown("🚦 **Traffic Light:** 🟩 GREEN")
-            elif tl_state.upper() == "YELLOW":
-                violation_container.markdown("🚦 **Traffic Light:** 🟨 YELLOW")
-            else:
-                violation_container.markdown("🚦 **Traffic Light:** ⚫ UNKNOWN")
-
-        # Table update
-        if st.session_state.violations_log:
-            df = pd.DataFrame(st.session_state.violations_log)
-            if filter_type != "All":
-                df = df[df["Violation"] == filter_type]
-            table_placeholder.dataframe(df, use_container_width=True)
+            # Table update
+            if st.session_state.violations_log:
+                df = pd.DataFrame(st.session_state.violations_log)
+                if filter_type != "All":
+                    df = df[df["Violation"] == filter_type]
+                table_placeholder.dataframe(df, use_container_width=True)
 
         time.sleep(0.1)
 
@@ -188,27 +205,6 @@ finally:
         cap.release()
     if tmp_file and os.path.exists(tmp_file):
         os.remove(tmp_file)
-
-# ---------------------------
-# 📡 Live MongoDB Viewer
-# ---------------------------
-st.sidebar.markdown("---")
-st.sidebar.subheader("📡 MongoDB Live Data")
-
-if st.sidebar.button("🔄 Refresh MongoDB"):
-    st.cache_data.clear()
-
-try:
-    mongo_data = get_all_violations(limit=10)  # latest 10 violations
-    if mongo_data:
-        df_mongo = pd.DataFrame(mongo_data)
-        if "_id" in df_mongo.columns:
-            df_mongo = df_mongo.drop(columns=["_id"])
-        st.sidebar.dataframe(df_mongo, use_container_width=True)
-    else:
-        st.sidebar.info("No records in MongoDB yet.")
-except Exception as e:
-    st.sidebar.error(f"Mongo fetch error: {e}")
 
 # ---------------------------
 # 📊 Audit Report Button

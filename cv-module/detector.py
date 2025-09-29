@@ -169,7 +169,7 @@ class SimpleTracker:
 class TrafficDetector:
     def __init__(self,
                  model_path="models/yolov8n.pt",
-                 plate_model_path="models/yolov8n-license-plate.pt",
+                 plate_model_path="models/plate_best.pt",   # 🔥 apna model
                  conf=0.6,
                  easyocr_gpu=False):
         ensure_dirs()
@@ -178,7 +178,15 @@ class TrafficDetector:
         self.db_coll = init_db()
         self.rule_engine = RuleEngine(db_conn=self.db_coll)
         self.simple_tracker = SimpleTracker(max_lost=30, vel_hist_len=5)
-        self.plate_model = YOLO(plate_model_path) if plate_model_path and os.path.exists(plate_model_path) else None
+
+        # ✅ Plate model load
+        if plate_model_path and os.path.exists(plate_model_path):
+            self.plate_model = YOLO(plate_model_path)
+            print(f"[INFO] Plate model loaded: {plate_model_path}")
+        else:
+            self.plate_model = None
+            print("[WARN] No plate model found")
+
         self.ocr = easyocr.Reader(['en'], gpu=easyocr_gpu) if EASYOCR_AVAILABLE else None
         self.calibrator = AutoCalibrator(target_seconds=15, fps=25, min_vehicles=6, debug=False)
         self.pixsec_to_kmph = None
@@ -227,16 +235,23 @@ class TrafficDetector:
                 'plate': "NOT_DETECTED"
             })
 
-        # number plate detection
+        # ✅ number plate detection (full frame + match with vehicles)
         if self.plate_model and self.ocr:
+            plate_results = self.plate_model(frame, conf=0.25)
+            plate_boxes = []
+            for r in plate_results:
+                for b in getattr(r, "boxes", []):
+                    px1, py1, px2, py2 = map(int, b.xyxy[0].cpu().numpy())
+                    plate_boxes.append((px1, py1, px2, py2))
+
+            print(f"[DEBUG] Plates detected: {len(plate_boxes)}")  # debug
+
+            # match plates with tracked vehicles
             for t in tracked_list:
-                x1,y1,x2,y2 = t['bbox']
-                crop = frame[y1:y2, x1:x2]
-                plate_res = self.plate_model(crop)
-                for r in plate_res:
-                    for b in getattr(r, "boxes", []):
-                        px1, py1, px2, py2 = map(int, b.xyxy[0].cpu().numpy())
-                        plate_crop = crop[py1:py2, px1:px2]
+                vx1, vy1, vx2, vy2 = t['bbox']
+                for (px1, py1, px2, py2) in plate_boxes:
+                    if px1 > vx1 and py1 > vy1 and px2 < vx2 and py2 < vy2:
+                        plate_crop = frame[py1:py2, px1:px2]
                         text = self.ocr.readtext(plate_crop, detail=0)
                         if text:
                             t['plate'] = clean_plate_text("".join(text))
@@ -256,7 +271,6 @@ class TrafficDetector:
         allowed_dir = getattr(self.rule_engine, "allowed_direction", (0, 1))
         tl_state = self.rule_engine._get_traffic_light_state(frame, tracked_list)
 
-        # backup TL classifier if unknown
         if tl_state is None or tl_state == "UNKNOWN":
             for d in dets:
                 if d["cls_name"] == "traffic light":
@@ -274,12 +288,10 @@ class TrafficDetector:
         # --- Annotation ---
         annotated = frame.copy()
 
-        # stop line
         color = (0, 255, 0) if tl_state != "RED" else (0, 0, 255)
         cv2.line(annotated, (0, self.rule_engine.stop_line_y),
                  (frame.shape[1], self.rule_engine.stop_line_y), color, 2)
 
-        # allowed direction arrow
         ax, ay = allowed_dir
         center = (frame.shape[1]//2, frame.shape[0]-30)
         cv2.arrowedLine(annotated, center,
