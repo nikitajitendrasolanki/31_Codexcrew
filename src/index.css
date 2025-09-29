@@ -2,4 +2,46 @@
 @tailwind components;
 @tailwind utilities;
 
-html, body, #root { height: 100%; }
+/* Optional: custom styles */
+body {
+  font-family: 'Rajdhani', sans-serif;
+  @apply bg-surface-900 text-gray-100 antialiased;
+}
+
+/* Thematic helpers matching the reference look */
+.bg-tech {
+  /* deep dark with subtle grid overlay */
+  background-color: #0b0d10;
+  background-image:
+    linear-gradient(rgba(0,0,0,0.32), rgba(0,0,0,0.52)),
+    url('/bg-circuit.jpg');
+  background-size: cover;
+  background-position: center;
+  background-attachment: fixed;
+}
+
+.card {
+  @apply backdrop-blur-md border-[3px] border-red-900/60 rounded-xl shadow-lg transition-transform duration-200;
+  background: rgba(18, 18, 18, 0.25);
+  box-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.37);
+}
+
+.card:hover { @apply -translate-y-0.5 shadow-glow-red; }
+
+/* Ensure buttons also glow red on hover */
+.btn-primary:hover,
+.btn-ghost:not(.no-glow):hover { @apply shadow-glow-red; }
+
+.btn-primary {
+  @apply inline-flex items-center justify-center gap-2 px-5 py-2.5 rounded-md font-semibold bg-primary text-white shadow-md hover:bg-primary-700 focus:outline-none focus:ring-2 focus:ring-primary/50 active:scale-[0.98];
+}
+
+.btn-ghost {
+  @apply inline-flex items-center justify-center gap-2 px-5 py-2.5 rounded-md font-semibold border-[3px] border-red-900/60 text-primary hover:bg-primary/10;
+}
+
+.heading-xl { @apply font-display text-5xl md:text-6xl font-extrabold tracking-tight; }
+.heading-lg { @apply font-display text-3xl md:text-4xl font-bold; }
+.eyebrow { @apply uppercase tracking-widest text-primary/80 text-xs font-semibold; }
+
+.divider-red { @apply h-px w-full bg-gradient-to-r from-transparent via-primary/40 to-transparent; }
